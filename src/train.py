@@ -19,25 +19,7 @@ import config
 ### UTILIY FUNCTIONS
 
 
-def check_device(device: str) -> str:
-    """
-    Check if desired device is available.
-
-    Args:
-        device (str): Device to check.
-
-    Returns:
-        str: Final device.
-    """
-    if (device == names.CUDA) and (torch.cuda.is_available()):
-        return names.CUDA
-    else:
-        return names.CPU
-
-
-def greedy_action(
-    params: Dict[str, Any], network: nn.Module, state: List[float]
-) -> int:
+def greedy_action(network: nn.Module, state: List[float]) -> int:
     """
     Choose the greedy action.
 
@@ -49,9 +31,8 @@ def greedy_action(
     Returns:
         int: Greedy action to take.
     """
-    device = check_device(device=params[names.DEVICE])
     with torch.no_grad():
-        Q = network(torch.Tensor(state).unsqueeze(0).to(device))
+        Q = network(torch.Tensor(state).unsqueeze(0).to("cpu"))
         return torch.argmax(Q).item()
 
 
@@ -99,18 +80,17 @@ _Memory = typing.TypeVar(name="_Memory", bound="Memory")
 
 
 class Memory:
-    def __init__(self: _Memory, params: Dict[str, Any]) -> None:
+    def __init__(self: _Memory) -> None:
         """
         Initialize class instance.
 
         Args:
             self (_Memory): Class instance.
-            params (Dict[str, Any]): Parameters of the agent.
         """
-        self.max_memory = params[names.MEMORY_CAPACITY]
+        self.max_memory = 40000
         self.curr_memory = []
         self.position = 0
-        self.device = params[names.DEVICE]
+        self.device = "cpu"
 
     def append(
         self: _Memory,
@@ -160,7 +140,7 @@ _DQN = typing.TypeVar(name="_DQN", bound="DQN")
 
 
 class DQN:
-    def __init__(self: _DQN, params: Dict[str, Any]) -> None:
+    def __init__(self: _DQN) -> None:
         """
         Initialize class instance.
 
@@ -168,9 +148,8 @@ class DQN:
             self (_DQN): Class instance.
             params (Dict[str, Any]): Parameters of teh agent.
         """
-        self.params = params
-        self.memory = Memory(params=self.params)
-        self.network = self.create_network().to(self.params[names.DEVICE])
+        self.memory = Memory()
+        self.network = self.create_network().to("cpu")
 
         self.best_reward = -float("inf")
         self.epoch_rewards = []
@@ -186,22 +165,16 @@ class DQN:
             nn.Module: Neural network.
         """
         layers = [
-            nn.Linear(
-                self.params[names.STATE_SPACE_DIMENSION], self.params[names.HIDDEN_SIZE]
-            ),
+            nn.Linear(6, 256),
             nn.ReLU(),
         ]
-        for _ in range(self.params[names.NB_LAYERS]):
-            layers.append(
-                nn.Linear(
-                    self.params[names.HIDDEN_SIZE], self.params[names.HIDDEN_SIZE]
-                )
-            )
+        for _ in range(2):
+            layers.append(nn.Linear(256, 256))
             layers.append(nn.ReLU())
         layers.append(
             nn.Linear(
-                self.params[names.HIDDEN_SIZE],
-                self.params[names.ACTION_SPACE_DIMENSION],
+                256,
+                4,
             )
         )
         network = nn.Sequential(*layers)
@@ -214,10 +187,10 @@ class DQN:
         Args:
             self (_DQN): Class instance.
         """
-        if len(self.memory) > self.params[names.BATCH_SIZE]:
-            X, A, R, Y, D = self.memory.sample(self.params[names.BATCH_SIZE])
+        if len(self.memory) > 1000:
+            X, A, R, Y, D = self.memory.sample(1000)
             QYmax = self.target_network(Y).max(1)[0].detach()
-            update = torch.addcmul(R, 1 - D, QYmax, value=self.params[names.GAMMA])
+            update = torch.addcmul(R, 1 - D, QYmax, value=0.90)
             QXA = self.network(X).gather(1, A.to(torch.long).unsqueeze(1))
             loss = self.criterion(QXA, update.unsqueeze(1))
             self.optimizer.zero_grad()
@@ -232,48 +205,50 @@ class DQN:
             self (_DQN): Class instance.
             env (HIVPatient): Environment.
         """
-        self.target_network = deepcopy(self.network).to(self.params[names.DEVICE])
-        self.best_model = self.network
-        self.criterion = create_criterion(loss=self.params[names.CRITERION])
-        self.optimizer = create_optimizer(
-            optimizer=self.params[names.OPTIMIZER],
-            network=self.network,
-            lr=self.params[names.LEARNING_RATE],
-        )
+        network = self.create_network()
+        target_network = deepcopy(network).to("cpu")
+        best_model = self.network
+        criterion = nn.SmoothL1Loss()
+        optimizer = torch.optim.Adam(network.parameters(), lr=0.0005)
         epoch = 0
         epoch_cum_reward = 0
         state, _ = env.reset()
-        epsilon = self.params[names.EPSILON_MAX]
+        epsilon = 1.0
         step = 0
         max_reward = -float("inf")
-        while epoch < self.params[names.NB_EPOCHS]:
+        epsilon_step = (1.0 - 0.07) / 40000
+        while epoch < 500:
             start_time = time.time()
-            if step > self.params[names.EPSILON_DECAY_DELAY]:
+            if step > 500:
                 epsilon = max(
-                    self.params[names.EPSILON_MIN],
-                    epsilon - self.params[names.EPSILON_STEP],
+                    0.07,
+                    epsilon - epsilon_step,
                 )
             if np.random.rand() < epsilon:
                 action = env.action_space.sample()
             else:
-                action = greedy_action(
-                    params=self.params, network=self.network, state=state
-                )
+                action = greedy_action(network=network, state=state)
             next_state, reward, done, trunc, _ = env.step(action)
             self.memory.append(state, action, reward, next_state, done)
             epoch_cum_reward += reward
-            for _ in range(self.params[names.GRADIENT_STEPS]):
-                self.gradient_step()
-            if self.params[names.UPDATE_STRATEGY] == names.EMA:
-                target_state_dict = self.target_network.state_dict()
-                network_state_dict = self.network.state_dict()
-                tau = self.params[names.UPDATE_TAU]
-                for key in network_state_dict:
-                    target_state_dict[key] = (
-                        tau * network_state_dict[key]
-                        + (1 - tau) * target_state_dict[key]
-                    )
-                self.target_network.load_state_dict(target_state_dict)
+            for _ in range(2):
+                if len(self.memory) > 1000:
+                    X, A, R, Y, D = self.memory.sample(1000)
+                    QYmax = target_network(Y).max(1)[0].detach()
+                    update = torch.addcmul(R, 1 - D, QYmax, value=0.90)
+                    QXA = network(X).gather(1, A.to(torch.long).unsqueeze(1))
+                    loss = criterion(QXA, update.unsqueeze(1))
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+            target_state_dict = target_network.state_dict()
+            network_state_dict = network.state_dict()
+            tau = 0.005
+            for key in network_state_dict:
+                target_state_dict[key] = (
+                    tau * network_state_dict[key] + (1 - tau) * target_state_dict[key]
+                )
+            target_network.load_state_dict(target_state_dict)
             step += 1
             if done or trunc:
                 end_time = time.time()
@@ -283,8 +258,8 @@ class DQN:
                 )
                 self.epoch_rewards.append(epoch_cum_reward)
                 if epoch_cum_reward > max_reward:
-                    self.best_model = self.network
-                    self.best_reward = float(epoch_cum_reward)
+                    best_model = network
+                    best_reward = float(epoch_cum_reward)
                     max_reward = epoch_cum_reward
                 epoch += 1
                 state, _ = env.reset()
@@ -292,7 +267,8 @@ class DQN:
             else:
                 state = next_state
         print("Training done.")
-        print(f"Best reward : {self.best_reward/1e10:.2f}.1e10")
+        print(f"Best reward : {best_reward/1e10:.2f}.1e10")
+        return best_model
 
 
 _ProjectAgent = typing.TypeVar(name="_ProjectAgent", bound="ProjectAgent")
@@ -307,32 +283,8 @@ class ProjectAgent:
             self (_ProjectAgent): Class instance.
         """
         self.id_experiment = 8
-        self.params = config.EXPERIMENTS[self.id_experiment]
-        self.params[names.DEVICE] = check_device(device=self.params[names.DEVICE])
-        self.update_params(
-            state_space_dimension=6,
-            action_space_dimension=4,
-        )
-        self.model = DQN(params=self.params)
-
-    def update_params(
-        self: _ProjectAgent,
-        state_space_dimension: int,
-        action_space_dimension: int,
-    ) -> None:
-        """
-        Update the parameters of the agent given the environment.
-
-        Args:
-            self (_ProjectAgent): Class instance.
-            state_space_dimension (int): Dimension of the state space.
-            action_space_dimension (int): Dimension of the action space.
-        """
-        self.params[names.STATE_SPACE_DIMENSION] = state_space_dimension
-        self.params[names.ACTION_SPACE_DIMENSION] = action_space_dimension
-        self.params[names.EPSILON_STEP] = (
-            self.params[names.EPSILON_MAX] - self.params[names.EPSILON_MIN]
-        ) / self.params[names.EPSILON_DECAY_PERIOD]
+        self.model = DQN()
+        self.best_model = self.model.create_network()
 
     def act(
         self: _ProjectAgent, observation: List[float], use_random: bool = False
@@ -350,14 +302,10 @@ class ProjectAgent:
         """
         if use_random:
             return 0
-        self.model.network.eval()
+        self.best_model.eval()
         with torch.no_grad():
-            state_tensor = (
-                torch.FloatTensor(observation)
-                .unsqueeze(0)
-                .to(self.params[names.DEVICE])
-            )
-            Q_values = self.model.network(state_tensor)
+            state_tensor = torch.FloatTensor(observation).unsqueeze(0).to("cpu")
+            Q_values = self.best_model(state_tensor)
         return torch.argmax(Q_values, dim=1).item()
 
     def save(self: _ProjectAgent, path: str | None = None) -> None:
@@ -370,7 +318,7 @@ class ProjectAgent:
         folder = os.path.join("src", "saved_models")
         os.makedirs(folder, exist_ok=True)
         torch.save(
-            self.model.best_model.state_dict(),
+            self.best_model.state_dict(),
             os.path.join(folder, f"agent_{self.id_experiment}.pth"),
         )
 
@@ -381,11 +329,11 @@ class ProjectAgent:
         Args:
             self (_ProjectAgent): Class isnatnce.
         """
-        self.model.network.load_state_dict(
+        self.best_model.load_state_dict(
             torch.load(
                 "best_model.pth",
                 weights_only=True,
-                map_location=torch.device(self.params[names.DEVICE]),
+                map_location=torch.device("cpu"),
             )
         )
 
@@ -395,7 +343,7 @@ class ProjectAgent:
 #     from gymnasium.wrappers import TimeLimit
 
 #     agent = ProjectAgent()
-#     agent.model.train(
+#     agent.best_model = agent.model.train(
 #         env=TimeLimit(
 #             env=FastHIVPatient(domain_randomization=False), max_episode_steps=200
 #         )
